@@ -1,0 +1,82 @@
+#!/bin/sh
+
+if [ "$#" -ne 2 ]; then
+	echo "generate_account: Required arguments: account_name organization_name" 1>&2
+	exit 1
+fi
+
+accountname="$1"
+accountorg="$2"
+
+# TODO: validate accountname, org (no spaces, etc)
+echo -n "${accountname}" | grep -q '^[a-z0-9]\([a-z0-9-]*[a-z0-9]\)\?$'
+if [ $? -ne 0 ]; then
+	echo "'${accountname}' is not a valid kubernetes namespace name" 1>&2
+	exit 1
+fi
+
+ORIGKUBECONFIG="${KUBECONFIG}"
+
+if kubectl get namespace ${accountname} > /dev/null 2>&1; then
+	echo "namespace ${accountname} already exists" 1>&2
+	exit 1
+fi
+
+mkdir ${accountname}
+cd ${accountname}
+
+kubectl create namespace ${accountname}
+
+# generate and sign the new certificate
+CERT_VALIDITY_PERIOD=730 #days
+openssl genrsa -out ${accountname}.key 2048
+openssl req -new -key ${accountname}.key -out ${accountname}.csr -subj "/CN=${accountname}/O=${accountorg}"
+openssl x509 -req -in ${accountname}.csr -CA /etc/kubernetes/pki/ca.crt -CAkey /etc/kubernetes/pki/ca.key -CAcreateserial -out ${accountname}.crt -days ${CERT_VALIDITY_PERIOD}
+
+# Make a copy of our existing kubeconfig (which has the necessary cluster information)
+# and insert the new user crednetials into it
+kubectl config view --flatten > ${accountname}.yaml
+export KUBECONFIG=`pwd`/${accountname}.yaml
+kubectl config set-credentials ${accountname} --client-certificate=${accountname}.crt  --client-key=${accountname}.key
+kubectl config set-context ${accountname} --cluster=kubernetes --namespace=${accountname} --user=${accountname}
+kubectl config use-context ${accountname}
+# Important! Extract only the new context from the config, to strip out the admin credentials.
+kubectl config view --flatten --minify --context ${accountname} > tmp.yaml
+mv -f tmp.yaml ${accountname}.yaml
+
+# Switch back to using the original admin config to create appropriate RBAC
+export KUBECONFIG="${ORIGKUBECONFIG}"
+
+cat << EOF > ${accountname}-rolebinding.yaml
+kind: RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1beta1
+metadata:
+  name: ${accountname}-binding
+  namespace: ${accountname}
+subjects:
+- kind: User
+  name: ${accountname}
+  apiGroup: ""
+roleRef:
+  kind: ClusterRole
+  name: external-user
+  apiGroup: ""
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1beta1
+metadata:
+  name: ${accountname}-global-binding
+subjects:
+- kind: User
+  name: ${accountname}
+  apiGroup: ""
+roleRef:
+  kind: ClusterRole
+  name: external-user-global
+  apiGroup: ""
+EOF
+
+kubectl create -f ${accountname}-rolebinding.yaml
+
+echo "Created kubernetes namespace/account ${accountname}"
+echo "The corresponding kubeconfig is $(pwd)/${accountname}.yaml"
